@@ -96,11 +96,25 @@ class NeRFModel(BaseModel):
         t_origins = rays_o[ray_indices]
         t_dirs = rays_d[ray_indices]
         midpoints = (t_starts + t_ends) / 2.
-        positions = t_origins + t_dirs * midpoints  
+        positions = t_origins + t_dirs * midpoints
         intervals = t_ends - t_starts
 
-        density, feature = self.geometry(positions) 
-        rgb = self.texture(feature, t_dirs)
+        # FullyFusedMLP requires batch size to be a multiple of 128; pad if needed
+        n_samples = positions.shape[0]
+        pad = (128 - n_samples % 128) % 128
+        if pad > 0:
+            positions = torch.cat([positions, positions.new_zeros(pad, positions.shape[-1])], dim=0)
+            t_dirs_net = torch.cat([t_dirs, t_dirs.new_zeros(pad, t_dirs.shape[-1])], dim=0)
+        else:
+            t_dirs_net = t_dirs
+
+        density, feature = self.geometry(positions)
+        rgb = self.texture(feature, t_dirs_net)
+
+        if pad > 0:
+            density = density[:n_samples]
+            feature = feature[:n_samples]
+            rgb = rgb[:n_samples]
 
         weights = render_weight_from_density(t_starts, t_ends, density[...,None], ray_indices=ray_indices, n_rays=n_rays)
         opacity = accumulate_along_rays(weights, ray_indices, values=None, n_rays=n_rays)
