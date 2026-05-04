@@ -95,7 +95,10 @@ def main():
         strategy = 'dp'
         assert n_gpus == 1
     else:
-        strategy = 'ddp_find_unused_parameters_false'
+        from pytorch_lightning.strategies import DDPStrategy
+        # find_unused_parameters=True is required because confidence_mlp params
+        # receive no gradient before conf_active turns on at start_step
+        strategy = DDPStrategy(find_unused_parameters=True)
     
     trainer = Trainer(
         devices=n_gpus,
