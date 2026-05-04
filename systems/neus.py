@@ -27,6 +27,7 @@ class NeuSSystem(BaseSystem):
         }
         self.train_num_samples = self.config.model.train_num_rays * (self.config.model.num_samples_per_ray + self.config.model.get('num_samples_per_ray_bg', 0))
         self.train_num_rays = self.config.model.train_num_rays
+        self.ema_variance = None   # lazy-initialized on first training batch
 
     def forward(self, batch):
         return self.model(batch['rays'])
@@ -40,13 +41,45 @@ class NeuSSystem(BaseSystem):
             else:
                 index = torch.randint(0, len(self.dataset.all_images), size=(1,), device=self.dataset.all_images.device)
         if stage in ['train']:
+            # --- lazy EMA buffer init (needs dataset dims, available here) ---
+            if self.ema_variance is None:
+                N_img = len(self.dataset.all_images)
+                # start at near-zero variance → near-max confidence at activation
+                self.ema_variance = torch.full(
+                    (N_img, self.dataset.h, self.dataset.w), 1e-4,
+                    device=self.rank
+                )
+
+            conf_cfg = self.config.model.get('conf', None)
+            _use_ray_sampling = (
+                conf_cfg is not None
+                and conf_cfg.get('enabled', False)
+                and conf_cfg.get('use_ray_sampling', False)
+                and self.model.conf_active
+            )
+
+            if _use_ray_sampling:
+                # sample rays proportional to confidence (inverse variance)
+                flat = 1.0 / (self.ema_variance.view(-1) + 1e-4)
+                probs = flat / flat.sum()
+                sampled = torch.multinomial(probs, self.train_num_rays, replacement=True)
+                H, W = self.dataset.h, self.dataset.w
+                index = sampled // (H * W)
+                remainder = sampled % (H * W)
+                y = remainder // W
+                x = remainder % W
+            else:
+                x = torch.randint(
+                    0, self.dataset.w, size=(self.train_num_rays,), device=self.dataset.all_images.device
+                )
+                y = torch.randint(
+                    0, self.dataset.h, size=(self.train_num_rays,), device=self.dataset.all_images.device
+                )
+
+            # expand scalar image index to per-ray for EMA indexing
+            ray_idx = index.expand(self.train_num_rays) if index.shape[0] == 1 else index
+
             c2w = self.dataset.all_c2w[index]
-            x = torch.randint(
-                0, self.dataset.w, size=(self.train_num_rays,), device=self.dataset.all_images.device
-            )
-            y = torch.randint(
-                0, self.dataset.h, size=(self.train_num_rays,), device=self.dataset.all_images.device
-            )
             if self.dataset.directions.ndim == 3: # (H, W, 3)
                 directions = self.dataset.directions[y, x]
             elif self.dataset.directions.ndim == 4: # (N, H, W, 3)
@@ -83,7 +116,13 @@ class NeuSSystem(BaseSystem):
             'rays': rays,
             'rgb': rgb,
             'fg_mask': fg_mask
-        })      
+        })
+        if stage in ['train']:
+            batch.update({
+                'ray_idx': ray_idx,
+                'ray_x': x,
+                'ray_y': y,
+            })
     
     def training_step(self, batch, batch_idx):
         out = self(batch)
@@ -103,9 +142,54 @@ class NeuSSystem(BaseSystem):
         self.log('train/loss_rgb', loss_rgb_l1)
         loss += loss_rgb_l1 * self.C(self.config.system.loss.lambda_rgb_l1)        
 
-        loss_eikonal = ((torch.linalg.norm(out['sdf_grad_samples'], ord=2, dim=-1) - 1.)**2).mean()
+        conf_cfg = self.config.model.get('conf', None)
+        _conf_on = (
+            conf_cfg is not None
+            and conf_cfg.get('enabled', False)
+            and self.model.conf_active
+            and 'eikonal_points' in out
+        )
+
+        # --- EMA variance update (detached, no grad) ---
+        if _conf_on:
+            with torch.no_grad():
+                residuals = (out['comp_rgb_full'] - batch['rgb']).abs().mean(-1)
+                alpha = conf_cfg.get('ema_alpha', 0.99)
+                idx, ry, rx = batch['ray_idx'], batch['ray_y'], batch['ray_x']
+                self.ema_variance[idx, ry, rx] = (
+                    alpha * self.ema_variance[idx, ry, rx] + (1.0 - alpha) * residuals
+                )
+
+        # --- eikonal loss (importance-sampled when enabled) ---
+        if _conf_on and conf_cfg.get('use_eikonal_importance', True):
+            with torch.no_grad():
+                conf = self.model.get_confidence(out['eikonal_points'])
+                temp = conf_cfg.get('sample_temperature', 3.0)
+                probs = conf.pow(1.0 / temp)
+                probs = probs / (probs.sum() + 1e-8)
+                ratio = conf_cfg.get('eikonal_sample_ratio', 0.5)
+                n_sub = max(1, int(len(conf) * ratio))
+                eik_idx = torch.multinomial(probs, n_sub, replacement=False)
+            grad_sub = out['sdf_grad_samples'][eik_idx]
+            loss_eikonal = ((torch.linalg.norm(grad_sub, ord=2, dim=-1) - 1.)**2).mean()
+        else:
+            loss_eikonal = ((torch.linalg.norm(out['sdf_grad_samples'], ord=2, dim=-1) - 1.)**2).mean()
+
         self.log('train/loss_eikonal', loss_eikonal)
         loss += loss_eikonal * self.C(self.config.system.loss.lambda_eikonal)
+
+        # --- confidence supervision loss Lconf ---
+        if _conf_on:
+            conf_pred = self.model.get_confidence(out['eikonal_points'])
+            with torch.no_grad():
+                # map per-ray EMA variance to per-sample via ray_indices
+                ray_var = self.ema_variance[batch['ray_idx'], batch['ray_y'], batch['ray_x']]
+                sample_var = ray_var[out['ray_indices']]
+                target = (1.0 / (sample_var + 1e-4))
+                target = (target / (target.max() + 1e-8)).clamp(0.0, 1.0)
+            loss_conf = F.mse_loss(conf_pred, target)
+            self.log('train/loss_conf', loss_conf)
+            loss += loss_conf * self.C(self.config.system.loss.lambda_conf)
         
         opacity = torch.clamp(out['opacity'].squeeze(-1), 1.e-3, 1.-1.e-3)
         loss_mask = binary_cross_entropy(opacity, batch['fg_mask'].float())

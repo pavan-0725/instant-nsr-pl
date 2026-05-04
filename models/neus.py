@@ -12,6 +12,29 @@ from nerfacc import ContractionType, OccupancyGrid, ray_marching, render_weight_
 from nerfacc.intersection import ray_aabb_intersect
 
 
+class ConfidenceMLP(nn.Module):
+    """Lightweight head that predicts per-point geometric confidence in (0,1)
+    from hash-grid features. Mirrors VanillaMLP style: plain nn.Linear,
+    kaiming init, autocast disabled so it stays float32 under precision=16."""
+
+    def __init__(self, in_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 1),
+            nn.Sigmoid(),
+        )
+        for layer in self.net:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_uniform_(layer.weight, nonlinearity='relu')
+                nn.init.constant_(layer.bias, 0.0)
+
+    @torch.cuda.amp.autocast(False)
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.net(h.float()).squeeze(-1)  # (N,)
+
+
 class VarianceNetwork(nn.Module):
     def __init__(self, config):
         super(VarianceNetwork, self).__init__()
@@ -59,6 +82,14 @@ class NeuSModel(BaseModel):
             self.render_step_size_bg = 0.01            
 
         self.variance = VarianceNetwork(self.config.variance)
+
+        # ConfidenceMLP — always created so the optimizer param group resolves;
+        # only activated when model.conf.enabled=true and past start_step.
+        enc_dim = self.geometry.encoding.n_output_dims
+        self.confidence_mlp = ConfidenceMLP(enc_dim)
+        self.conf_active = False   # toggled in update_step
+        self.conf_ramp   = 0.0     # 0→1 linear ramp after start_step
+
         self.register_buffer('scene_aabb', torch.as_tensor([-self.config.radius, -self.config.radius, -self.config.radius, self.config.radius, self.config.radius, self.config.radius], dtype=torch.float32))
         if self.config.grid_prune:
             self.occupancy_grid = OccupancyGrid(
@@ -83,6 +114,20 @@ class NeuSModel(BaseModel):
             update_module_step(self.geometry_bg, epoch, global_step)
             update_module_step(self.texture_bg, epoch, global_step)
         update_module_step(self.variance, epoch, global_step)
+
+        conf_cfg = self.config.get('conf', None)
+        if conf_cfg is not None and conf_cfg.get('enabled', False):
+            start = int(conf_cfg.get('start_step', 15000))
+            ramp  = max(int(conf_cfg.get('ramp_steps', 5000)), 1)
+            if global_step >= start:
+                self.conf_active = True
+                self.conf_ramp = min(1.0, (global_step - start) / ramp)
+            else:
+                self.conf_active = False
+                self.conf_ramp = 0.0
+        else:
+            self.conf_active = False
+            self.conf_ramp = 0.0
 
         cos_anneal_end = self.config.get('cos_anneal_end', 0)
         self.cos_anneal_ratio = 1.0 if cos_anneal_end == 0 else min(1.0, global_step / cos_anneal_end)
@@ -109,6 +154,16 @@ class NeuSModel(BaseModel):
             self.occupancy_grid.every_n_step(step=global_step, occ_eval_fn=occ_eval_fn, occ_thre=self.config.get('grid_prune_occ_thre', 0.01))
             if self.config.learned_background:
                 self.occupancy_grid_bg.every_n_step(step=global_step, occ_eval_fn=occ_eval_fn_bg, occ_thre=self.config.get('grid_prune_occ_thre_bg', 0.01))
+
+    def get_confidence(self, points: torch.Tensor) -> torch.Tensor:
+        """Query confidence MLP at world-space points.
+        Hash features are detached so Lconf does not modify the SDF encoding."""
+        from models.geometry import contract_to_unisphere
+        pts = contract_to_unisphere(
+            points.detach(), self.geometry.radius, self.geometry.contraction_type
+        )
+        h = self.geometry.encoding(pts.view(-1, 3)).detach()
+        return self.confidence_mlp(h)  # (N,)
 
     def isosurface(self):
         mesh = self.geometry.isosurface()
@@ -255,10 +310,11 @@ class NeuSModel(BaseModel):
             out.update({
                 'sdf_samples': sdf,
                 'sdf_grad_samples': sdf_grad,
+                'eikonal_points': positions,   # world-space coords for confidence query
                 'weights': weights.view(-1),
                 'points': midpoints.view(-1),
                 'intervals': dists.view(-1),
-                'ray_indices': ray_indices.view(-1)                
+                'ray_indices': ray_indices.view(-1)
             })
             if self.config.geometry.grad_type == 'finite_difference':
                 out.update({

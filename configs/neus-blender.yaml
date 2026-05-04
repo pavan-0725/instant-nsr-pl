@@ -34,6 +34,17 @@ model:
   variance:
     init_val: 0.3
     modulate: false
+  # --- confidence-weighted regularization (proposal components) ---
+  # Master switch: model.conf.enabled=false to run vanilla NeuS baseline
+  conf:
+    enabled: true
+    use_eikonal_importance: true   # §3.4 importance-sampled eikonal
+    use_ray_sampling: false        # §3.5 confidence-weighted ray sampling (off by default)
+    start_step: 15000              # step at which EMA + confidence head activate
+    ramp_steps: 5000               # linear ramp from uniform → confidence sampling
+    ema_alpha: 0.99                # EMA decay for per-pixel variance buffer
+    eikonal_sample_ratio: 0.5     # fraction of eikonal candidate points to keep
+    sample_temperature: 3.0       # softens sampling distribution to avoid collapse
   geometry:
     name: volume-sdf
     radius: ${model.radius}
@@ -82,6 +93,7 @@ system:
     lambda_rgb_l1: 0.
     lambda_mask: 0.1
     lambda_eikonal: 0.1
+    lambda_conf: 0.01
     lambda_curvature: 0.
     lambda_sparsity: 0.0
     lambda_distortion: 0.
@@ -99,6 +111,8 @@ system:
       texture:
         lr: 0.01
       variance:
+        lr: 0.001
+      confidence_mlp:
         lr: 0.001
   warmup_steps: 500
   scheduler:
