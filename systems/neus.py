@@ -59,15 +59,14 @@ class NeuSSystem(BaseSystem):
             )
 
             if _use_ray_sampling:
-                # sample rays proportional to confidence (inverse variance)
-                flat = 1.0 / (self.ema_variance.view(-1) + 1e-4)
-                probs = flat / flat.sum()
-                sampled = torch.multinomial(probs, self.train_num_rays, replacement=True)
-                H, W = self.dataset.h, self.dataset.w
-                index = sampled // (H * W)
-                remainder = sampled % (H * W)
-                y = remainder // W
-                x = remainder % W
+                # two-stage sampling to stay under torch.multinomial's 2^24 limit:
+                # stage 1 — sample images proportional to mean per-image confidence
+                img_conf = (1.0 / (self.ema_variance + 1e-4)).mean(dim=[1, 2])  # (N_img,)
+                img_probs = img_conf / img_conf.sum()
+                index = torch.multinomial(img_probs, self.train_num_rays, replacement=True)
+                # stage 2 — sample pixels uniformly within each selected image
+                x = torch.randint(0, self.dataset.w, size=(self.train_num_rays,), device=self.rank)
+                y = torch.randint(0, self.dataset.h, size=(self.train_num_rays,), device=self.rank)
             else:
                 x = torch.randint(
                     0, self.dataset.w, size=(self.train_num_rays,), device=self.dataset.all_images.device
