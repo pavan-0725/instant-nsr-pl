@@ -152,6 +152,17 @@ class SSIM():
             return _ssim.mean()
 
 
+class LPIPS(nn.Module):
+    def __init__(self):
+        super().__init__()
+        import lpips
+        self.net = lpips.LPIPS(net='vgg')
+
+    def forward(self, inputs, targets):
+        # inputs/targets: (1, 3, H, W) in [0, 1]
+        return self.net(inputs * 2 - 1, targets * 2 - 1).mean()
+
+
 def binary_cross_entropy(input, target):
     """
     F.binary_cross_entropy is not numerically stable in mixed-precision training.

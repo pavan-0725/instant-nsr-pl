@@ -11,7 +11,7 @@ from models.utils import cleanup
 from models.ray_utils import get_rays
 import systems
 from systems.base import BaseSystem
-from systems.criterions import PSNR, binary_cross_entropy
+from systems.criterions import PSNR, SSIM, LPIPS, binary_cross_entropy
 
 
 @systems.register('neus-system')
@@ -23,7 +23,9 @@ class NeuSSystem(BaseSystem):
     """
     def prepare(self):
         self.criterions = {
-            'psnr': PSNR()
+            'psnr': PSNR(),
+            'ssim': SSIM(),
+            'lpips': LPIPS(),
         }
         self.train_num_samples = self.config.model.train_num_rays * (self.config.model.num_samples_per_ray + self.config.model.get('num_samples_per_ray_bg', 0))
         self.train_num_rays = self.config.model.train_num_rays
@@ -253,8 +255,14 @@ class NeuSSystem(BaseSystem):
     
     def validation_step(self, batch, batch_idx):
         out = self(batch)
-        psnr = self.criterions['psnr'](out['comp_rgb_full'].to(batch['rgb']), batch['rgb'])
         W, H = self.dataset.img_wh
+        rgb_pred = out['comp_rgb_full'].to(batch['rgb'])
+        psnr = self.criterions['psnr'](rgb_pred, batch['rgb'])
+        # reshape to (1, 3, H, W) for SSIM and LPIPS
+        pred_img = rgb_pred.view(H, W, 3).permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+        gt_img   = batch['rgb'].view(H, W, 3).permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+        ssim  = self.criterions['ssim'](pred_img, gt_img)
+        lpips = self.criterions['lpips'](pred_img, gt_img)
         self.save_image_grid(f"it{self.global_step}-{batch['index'][0].item()}.png", [
             {'type': 'rgb', 'img': batch['rgb'].view(H, W, 3), 'kwargs': {'data_format': 'HWC'}},
             {'type': 'rgb', 'img': out['comp_rgb_full'].view(H, W, 3), 'kwargs': {'data_format': 'HWC'}}
@@ -267,16 +275,18 @@ class NeuSSystem(BaseSystem):
         ])
         return {
             'psnr': psnr,
+            'ssim': ssim,
+            'lpips': lpips,
             'index': batch['index']
         }
-          
-    
+
+
     """
     # aggregate outputs from different devices when using DP
     def validation_step_end(self, out):
         pass
     """
-    
+
     def validation_epoch_end(self, out):
         out = self.all_gather(out)
         if self.trainer.is_global_zero:
@@ -284,18 +294,35 @@ class NeuSSystem(BaseSystem):
             for step_out in out:
                 # DP
                 if step_out['index'].ndim == 1:
-                    out_set[step_out['index'].item()] = {'psnr': step_out['psnr']}
+                    out_set[step_out['index'].item()] = {
+                        'psnr': step_out['psnr'],
+                        'ssim': step_out['ssim'],
+                        'lpips': step_out['lpips'],
+                    }
                 # DDP
                 else:
                     for oi, index in enumerate(step_out['index']):
-                        out_set[index[0].item()] = {'psnr': step_out['psnr'][oi]}
-            psnr = torch.mean(torch.stack([o['psnr'] for o in out_set.values()]))
-            self.log('val/psnr', psnr, prog_bar=True, rank_zero_only=True)         
+                        out_set[index[0].item()] = {
+                            'psnr': step_out['psnr'][oi],
+                            'ssim': step_out['ssim'][oi],
+                            'lpips': step_out['lpips'][oi],
+                        }
+            psnr  = torch.mean(torch.stack([o['psnr']  for o in out_set.values()]))
+            ssim  = torch.mean(torch.stack([o['ssim']  for o in out_set.values()]))
+            lpips = torch.mean(torch.stack([o['lpips'] for o in out_set.values()]))
+            self.log('val/psnr',  psnr,  prog_bar=True, rank_zero_only=True)
+            self.log('val/ssim',  ssim,  prog_bar=True, rank_zero_only=True)
+            self.log('val/lpips', lpips, prog_bar=True, rank_zero_only=True)
 
     def test_step(self, batch, batch_idx):
         out = self(batch)
-        psnr = self.criterions['psnr'](out['comp_rgb_full'].to(batch['rgb']), batch['rgb'])
         W, H = self.dataset.img_wh
+        rgb_pred = out['comp_rgb_full'].to(batch['rgb'])
+        psnr = self.criterions['psnr'](rgb_pred, batch['rgb'])
+        pred_img = rgb_pred.view(H, W, 3).permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+        gt_img   = batch['rgb'].view(H, W, 3).permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+        ssim  = self.criterions['ssim'](pred_img, gt_img)
+        lpips = self.criterions['lpips'](pred_img, gt_img)
         self.save_image_grid(f"it{self.global_step}-test/{batch['index'][0].item()}.png", [
             {'type': 'rgb', 'img': batch['rgb'].view(H, W, 3), 'kwargs': {'data_format': 'HWC'}},
             {'type': 'rgb', 'img': out['comp_rgb_full'].view(H, W, 3), 'kwargs': {'data_format': 'HWC'}}
@@ -308,9 +335,11 @@ class NeuSSystem(BaseSystem):
         ])
         return {
             'psnr': psnr,
+            'ssim': ssim,
+            'lpips': lpips,
             'index': batch['index']
-        }      
-    
+        }
+
     def test_epoch_end(self, out):
         """
         Synchronize devices.
@@ -322,13 +351,25 @@ class NeuSSystem(BaseSystem):
             for step_out in out:
                 # DP
                 if step_out['index'].ndim == 1:
-                    out_set[step_out['index'].item()] = {'psnr': step_out['psnr']}
+                    out_set[step_out['index'].item()] = {
+                        'psnr': step_out['psnr'],
+                        'ssim': step_out['ssim'],
+                        'lpips': step_out['lpips'],
+                    }
                 # DDP
                 else:
                     for oi, index in enumerate(step_out['index']):
-                        out_set[index[0].item()] = {'psnr': step_out['psnr'][oi]}
-            psnr = torch.mean(torch.stack([o['psnr'] for o in out_set.values()]))
-            self.log('test/psnr', psnr, prog_bar=True, rank_zero_only=True)    
+                        out_set[index[0].item()] = {
+                            'psnr': step_out['psnr'][oi],
+                            'ssim': step_out['ssim'][oi],
+                            'lpips': step_out['lpips'][oi],
+                        }
+            psnr  = torch.mean(torch.stack([o['psnr']  for o in out_set.values()]))
+            ssim  = torch.mean(torch.stack([o['ssim']  for o in out_set.values()]))
+            lpips = torch.mean(torch.stack([o['lpips'] for o in out_set.values()]))
+            self.log('test/psnr',  psnr,  prog_bar=True, rank_zero_only=True)
+            self.log('test/ssim',  ssim,  prog_bar=True, rank_zero_only=True)
+            self.log('test/lpips', lpips, prog_bar=True, rank_zero_only=True)
 
             self.save_img_sequence(
                 f"it{self.global_step}-test",
